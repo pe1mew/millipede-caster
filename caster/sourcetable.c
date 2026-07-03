@@ -147,7 +147,7 @@ struct sourcetable *sourcetable_new(const char *host, unsigned short port, int t
 	this->json_config = json_config;
 	if (json_config)
 		json_object_get(json_config);
-	atomic_store(&this->refcnt, 1);
+	REFCNT_INIT(this);
 	return this;
 }
 
@@ -164,16 +164,8 @@ static void sourcetable_free(struct sourcetable *this) {
 	free(this);
 }
 
-void sourcetable_incref(struct sourcetable *this) {
-	assert(this->refcnt > 0);
-	atomic_fetch_add(&this->refcnt, 1);
-}
-
-void sourcetable_decref(struct sourcetable *this) {
-	assert(this->refcnt > 0);
-	if (atomic_fetch_add_explicit(&this->refcnt, -1, memory_order_relaxed) == 1)
-		sourcetable_free(this);
-}
+REFCNT_INCREF_BODY(sourcetable_incref, struct sourcetable);
+REFCNT_DECREF_BODY(sourcetable_decref, struct sourcetable, sourcetable_free);
 
 /*
  * Return sourcetable as a string.
@@ -186,7 +178,7 @@ struct mime_content *sourcetable_get(struct sourcetable *this) {
 	 * Compute string size for the final sourcetable.
 	 */
 
-	int len = strlen(this->header)+17;
+	size_t len = strlen(this->header)+17;
 
 	struct element *e;
 	struct hash_iterator hi;
@@ -291,7 +283,7 @@ static int _sourcetable_add_unlocked(struct sourcetable *this, const char *sourc
 				sourcetable_entry);
 		}
 	} else {
-		int new_len = strlen(this->header) + strlen(sourcetable_entry) + 3;
+		size_t new_len = strlen(this->header) + strlen(sourcetable_entry) + 3;
 		char *s = (char *)strrealloc(this->header, new_len);
 		if (s == NULL)
 			return -1;

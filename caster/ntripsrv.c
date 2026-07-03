@@ -60,8 +60,9 @@ send_server_reply(struct ntrip_state *this, struct evbuffer *ev,
 	msg = htc->message;
 
 	firstword = (this->client_version == 1 && firstword && this->user_agent_ntrip)?firstword:"HTTP/1.1";
-	struct tm *t = gmtime(&tstamp);
-	strftime(date, sizeof date, "%a, %d %b %Y %H:%M:%S GMT", t);
+	struct tm t;
+	gmtime_r(&tstamp, &t);
+	strftime(date, sizeof date, "%a, %d %b %Y %H:%M:%S GMT", &t);
 
 	len = evbuffer_add_printf(ev, "%s %d %s\r\n%sDate: %s\r\n", firstword, status_code, msg, server_headers, date);
 	if (len > 0) sent += len;
@@ -899,7 +900,7 @@ void ntripsrv_eventcb(struct bufferevent *bev, short events, void *arg)
 			 * recently sending data.
 			 */
 			if (ntrip_get_state(st) == NTRIP_WAIT_CLIENT_INPUT) {
-				int idle_time = time(NULL) - st->last_send;
+				int idle_time = time(NULL) - atomic_load(&st->last_send);
 				if (idle_time <= config->idle_max_delay) {
 					/* Re-enable read */
 					bufferevent_enable(bev, EV_READ);

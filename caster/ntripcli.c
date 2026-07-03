@@ -64,7 +64,7 @@ static char *ntripcli_http_request_str(struct ntrip_state *st,
 		return NULL;
 	}
 
-	int hlen = 0;
+	size_t hlen = 0;
 	TAILQ_FOREACH(np, &headers, next) {
 		// lengths of key + value + ": " + "\r\n"
 		hlen += strlen(np->key) + strlen(np->value) + 4;
@@ -81,7 +81,7 @@ static char *ntripcli_http_request_str(struct ntrip_state *st,
 		strfree(host_port);
 		return NULL;
 	}
-	sprintf(r, format, method, uri);
+	snprintf(r, s, format, method, uri);
 
 	ntrip_log(st, LOG_DEBUG, "Method %s", r);
 	display_headers(st, &headers);
@@ -447,11 +447,13 @@ ntripcli_new(struct caster_state *caster, char *host, unsigned short port, int t
 		/* Set the Server Name Indication TLS extension, for virtual server handling */
 		if (SSL_set_tlsext_host_name(ssl, host) < 0) {
 			ERR_print_errors_cb(caster_tls_log_cb, caster);
+			SSL_free(ssl);
 			return NULL;
 		}
 		/* Set hostname for certificate verification. */
 		if (SSL_set1_host(ssl, host) != 1) {
 			ERR_print_errors_cb(caster_tls_log_cb, caster);
+			SSL_free(ssl);
 			return NULL;
 		}
 		SSL_set_verify(ssl, SSL_VERIFY_PEER, NULL);
@@ -470,6 +472,8 @@ ntripcli_new(struct caster_state *caster, char *host, unsigned short port, int t
 
 	if (bev == NULL) {
 		logfmt(&caster->flog, LOG_ERR, "Error constructing bufferevent in ntripcli_start!");
+		if (ssl != NULL)
+			SSL_free(ssl);
 		return NULL;
 	}
 	struct ntrip_state *st = ntrip_new(caster, bev, host, port, uri,
@@ -477,6 +481,8 @@ ntripcli_new(struct caster_state *caster, char *host, unsigned short port, int t
 	if (st == NULL) {
 		bufferevent_free(bev);
 		logfmt(&caster->flog, LOG_ERR, "Error constructing ntrip_state in ntripcli_start!");
+		if (ssl != NULL)
+			SSL_free(ssl);
 		return NULL;
 	}
 	st->type = type;

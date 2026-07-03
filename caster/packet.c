@@ -6,9 +6,11 @@
 
 struct packet *packet_new(size_t len_raw) {
 	struct packet *this = (struct packet *)malloc(sizeof(struct packet) + len_raw);
+	if (this == NULL)
+		return NULL;
 	this->datalen = len_raw;
-	atomic_init(&this->refcnt, 1);
-	this->is_rtcm = 0;
+	REFCNT_INIT(this);
+	this->rtcm_state = PACKET_RAW;
 	return this;
 }
 
@@ -44,7 +46,7 @@ int packet_send(struct packet *packet, struct ntrip_state *st, time_t t) {
 		ntrip_log(st, LOG_CRIT, "evbuffer_add_reference failed");
 		return -1;
 	}
-	st->last_send = t;
+	atomic_store(&st->last_send, time(NULL));
 	st->sent_bytes += packet->datalen;
 	return 0;
 }
