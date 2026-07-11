@@ -28,10 +28,11 @@ _ntrip_task_restart_cb(int fd, short what, void *arg) {
  * Called on a successful connection.
  */
 static void connect_cb(struct ntrip_state *st){
+	struct ntrip_task *task = ntrip_state_task(st);
 	/* Reinitialize exponential backoff */
-	st->task->current_retry_delay = st->task->refresh_delay;
+	task->current_retry_delay = task->refresh_delay;
 
-	if (st->task->use_mimeq) {
+	if (task->use_mimeq) {
 		ntrip_set_state(st, NTRIP_IDLE_CLIENT);
 		ntrip_task_send_next_request(st);
 	} else
@@ -94,31 +95,45 @@ struct ntrip_task *ntrip_task_new(struct caster_state *caster,
 }
 
 /*
- * Protected access to clear the st pointer and
- * return a counted reference to its previous value, if not NULL.
+ * Clear task->st and the matching st->task back-pointer.
+ *
+ * Required lock: the bufferevent lock (bev) of task->st, if non-NULL.
+ * Returns a counted reference to the former task->st (transferred from the
+ * task's own reference), or NULL if task->st was already NULL. The caller
+ * must ntrip_decref() the returned reference.
  */
-struct ntrip_state *ntrip_task_clear_get_st(struct ntrip_task *this, int getref) {
+struct ntrip_state *ntrip_task_clear_get_st(struct ntrip_task *this) {
 	struct ntrip_state *rst;
 	P_RWLOCK_WRLOCK(&this->st_lock);
-	rst = getref ? this->st : NULL;
-	if (this->st != NULL) {
-		this->st->task = NULL;
-		if (!rst)
-			ntrip_decref(this->st, "ntrip_task_clear_st");
+	rst = this->st;
+	if (rst != NULL) {
+		/*
+		 * st->task is protected by bev, which the caller must hold.
+		 * task->st is protected by st_lock, held here.
+		 */
+		rst->task = NULL;
+		this->st = NULL;
 	}
-	this->st = NULL;
 	P_RWLOCK_UNLOCK(&this->st_lock);
 	return rst;
 }
 
+/*
+ * Clear task->st and the matching st->task back-pointer, then drop the
+ * task's reference to the former st.
+ *
+ * Required lock: the bufferevent lock (bev) of task->st, if non-NULL.
+ */
 void ntrip_task_clear_st(struct ntrip_task *this) {
-	ntrip_task_clear_get_st(this, 0);
+	struct ntrip_state *st = ntrip_task_clear_get_st(this);
+	if (st != NULL)
+		ntrip_decref(st, "ntrip_task_clear_st");
 }
 
 /*
  * Return a counted reference to the ntrip_state, or NULL.
  */
-static struct ntrip_state *ntrip_task_get_st_ref(struct ntrip_task *this) {
+struct ntrip_state *ntrip_task_get_st_ref(struct ntrip_task *this) {
 	P_RWLOCK_RDLOCK(&this->st_lock);
 	struct ntrip_state *st = this->st;
 	if (st != NULL)
@@ -131,6 +146,11 @@ enum task_state ntrip_task_get_state(struct ntrip_task *this) {
 	return atomic_load_explicit(&this->state, memory_order_relaxed);
 }
 
+/*
+ * Set task->st (counted reference) under st_lock.
+ * st->task must be set separately by the caller (ntripcli_new does this
+ * before the bev is enabled, so no concurrency on st->task at that point).
+ */
 static inline void ntrip_task_set_st(struct ntrip_task *this, struct ntrip_state *st) {
 	P_RWLOCK_WRLOCK(&this->st_lock);
 	ntrip_incref(st, "ntrip_task_set_st");
@@ -156,6 +176,13 @@ int ntrip_task_start(struct ntrip_task *this, void *reschedule_arg, struct lives
 	}
 
 	if (r < 0) {
+		/*
+		 * Only reached when ntripcli_new returned NULL (ntripcli_start
+		 * always returns 0), so this->st is still NULL and the clear is
+		 * a no-op. If a future change makes ntripcli_start fail after
+		 * set_st, acquire bev before clearing.
+		 */
+		assert(this->st == NULL);
 		ntrip_task_clear_st(this);
 		if (reschedule_arg != NULL)
 			ntrip_task_reschedule(this, reschedule_arg);
@@ -180,17 +207,47 @@ void ntrip_task_stop(struct ntrip_task *this) {
 	}
 	P_RWLOCK_UNLOCK(&this->mimeq_lock);
 
-	struct ntrip_state *st = ntrip_task_clear_get_st(this, 1);
+	/*
+	 * Take a counted reference (A) so the st stays alive across the
+	 * bufferevent_lock below, which may block waiting for an in-progress
+	 * libevent callback on the same st.
+	 */
+	struct ntrip_state *st = ntrip_task_get_st_ref(this);
 
-	if (st) {
-		logfmt(&this->caster->flog, LOG_INFO, "Stopping %s (%p) from %s:%d", this->type, this, this->host, this->port);
-		struct bufferevent *bev = st->bev;
-		bufferevent_lock(bev);
-		ntrip_decref_end(st, "ntrip_task_stop");
-		ntrip_decref(st, "ntrip_task_stop 2");
-		bufferevent_unlock(bev);
-	} else
+	if (st == NULL) {
 		logfmt(&this->caster->flog, LOG_INFO, "Stopping %s (%p) from %s:%d: not running", this->type, this, this->host, this->port);
+		return;
+	}
+
+	struct bufferevent *bev = st->bev;
+	bufferevent_lock(bev);
+
+	/*
+	 * Now that we hold bev (excludes libevent callbacks on this st),
+	 * clear task->st and st->task atomically. This transfers the task's
+	 * reference (B) to us, or returns NULL if a callback already cleared it.
+	 */
+	struct ntrip_state *st2 = ntrip_task_clear_get_st(this);
+
+	if (st2) {
+		logfmt(&this->caster->flog, LOG_INFO, "Stopping %s (%p) from %s:%d", this->type, this, this->host, this->port);
+		/*
+		 * Drop the start reference (via ntrip_decref_end, which also
+		 * sets NTRIP_END) and the task's former reference (B).
+		 */
+		ntrip_decref_end(st2, "ntrip_task_stop");
+		ntrip_decref(st2, "ntrip_task_stop 2");
+	} else {
+		/*
+		 * A libevent callback already cleared task->st and called
+		 * ntrip_decref_end. Only our peek reference (A) remains.
+		 */
+		assert(ntrip_get_state(st) == NTRIP_END);
+	}
+
+	/* Drop the peek reference (A). */
+	ntrip_decref(st, "ntrip_task_stop 3");
+	bufferevent_unlock(bev);
 }
 
 void ntrip_task_reschedule(struct ntrip_task *this, void *arg_cb) {
@@ -330,7 +387,7 @@ void ntrip_task_queue(struct ntrip_task *this, struct packet *packet) {
 void ntrip_task_send_next_request(struct ntrip_state *st) {
 	struct evbuffer *output = bufferevent_get_output(st->bev);
 	struct mime_content *m;
-	struct ntrip_task *task = st->task;
+	struct ntrip_task *task = ntrip_state_task(st);
 	assert(ntrip_get_state(st) == NTRIP_IDLE_CLIENT);
 	assert(task->pending == 0);
 	size_t size = 0;
@@ -376,7 +433,7 @@ void ntrip_task_send_next_request(struct ntrip_state *st) {
 				ntrip_decref_end(st, "ntrip_task_send_next_request");
 				return;
 			}
-			st->task->pending++;
+			task->pending++;
 			n--;
 		}
 	} else {
@@ -400,7 +457,7 @@ void ntrip_task_send_next_request(struct ntrip_state *st) {
 	 * Will close if it times out.
 	 * In other cases, just keep the connection idle.
 	 */
-	struct timeval read_timeout = { st->task->pending ? st->task->status_timeout : 0 };
+	struct timeval read_timeout = { task->pending ? task->status_timeout : 0 };
 	bufferevent_set_timeouts(st->bev, &read_timeout, NULL);
 	P_RWLOCK_UNLOCK(&task->mimeq_lock);
 }
@@ -429,7 +486,12 @@ static void ntrip_task_free(struct ntrip_task *this) {
 	ntrip_task_stop(this);
 	ntrip_task_drain_queue(this);
 
-	ntrip_task_clear_st(this);
+	/*
+	 * ntrip_task_stop already cleared task->st (and the matching
+	 * st->task), so this is a defensive no-op. The assert documents
+	 * the invariant; no bev is needed since st is NULL by construction.
+	 */
+	assert(this->st == NULL);
 
 	P_RWLOCK_WRLOCK(&this->mimeq_lock);
 	evhttp_clear_headers(&this->headers);
