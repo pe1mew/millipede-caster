@@ -1,0 +1,27 @@
+# Millipede NTRIP caster. See docker.md.
+#
+# Run from this directory (the source checkout), as the build context is the
+# repository itself. Persistent state lives outside it, under /srv/millipede.
+
+services:
+  caster:
+    build: .
+    image: millipede:latest
+    container_name: millipede
+    restart: unless-stopped
+    user: "1000:1000"
+    command: ["-c", "/etc/millipede/caster.yaml", "-t", "4"]
+    ports:
+      # Host 80 is mapped to 8080 in the container: the caster runs
+      # unprivileged and can't bind ports below 1024.
+      - "2101:2101"     # NTRIP
+      - "2443:2443"     # NTRIP over TLS
+      - "80:8080"       # Let's Encrypt HTTP-01 challenge
+    volumes:
+      # Configuration directory: caster.yaml and every file it refers to
+      # with a relative path, certificates included.
+      - /srv/millipede/config:/etc/millipede:ro
+      # ACME challenge tokens, written by certbot on the host.
+      - /srv/millipede/acme:/srv/acme:ro
+      # The only directory the caster needs to write to.
+      - /srv/millipede/log:/var/log/millipede

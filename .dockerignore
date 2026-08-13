@@ -1,0 +1,14 @@
+# Keep the build context small and avoid pulling host build artifacts into
+# the image (the build runs "make clean all" in caster/ anyway).
+.git
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
+docker.md
+build/
+caster/*.o
+caster/.depend
+caster/caster
+caster/tests
+tests/*.log
