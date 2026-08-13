@@ -966,10 +966,15 @@ void ntripsrv_listener_cb(struct evconnlistener *listener, evutil_socket_t fd,
 	struct caster_state *caster = listener_conf->caster;
 	struct event_base *base = caster_get_eventbase(caster);
 	struct bufferevent *bev;
-	SSL *ssl = NULL;
+	int tls;
 
-	if (listener_conf->tls) {
-		ssl = SSL_new(listener_conf->ssl_server_ctx);
+	/*
+	 * Get a SSL session from the listener configuration, which can be
+	 * replaced at any time by a configuration reload.
+	 */
+	SSL *ssl = listener_ssl_new(listener_conf, &tls);
+
+	if (tls) {
 		if (ssl == NULL) {
 			ERR_print_errors_cb(caster_tls_log_cb, caster);
 			close(fd);

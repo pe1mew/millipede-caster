@@ -33,9 +33,19 @@ struct listener {
 	struct evconnlistener *listener;	// libevent structure
 	struct caster_state *caster;
 
+	/*
+	 * TLS state, protected by lock as it can be replaced by a
+	 * configuration reload while other threads are accepting
+	 * connections.
+	 *
+	 * A SSL_CTX is never modified once published here: a reload
+	 * builds a new one and replaces the pointer. The old context is
+	 * kept alive by OpenSSL as long as sessions still reference it,
+	 * so handshakes in progress are unaffected.
+	 */
+	P_RWLOCK_T lock;
 	int tls;			// is TLS activated?
 	SSL_CTX *ssl_server_ctx;	// TLS context, certs etc.
-	char *hostname;			// hostname for TLS/SNI
 	REFCNT;
 };
 
@@ -142,6 +152,7 @@ struct caster_state {
 
 void caster_log_error(struct caster_state *this, char *orig);
 int caster_tls_log_cb(const char *str, size_t len, void *u);
+SSL *listener_ssl_new(struct listener *this, int *tls);
 int caster_main(char *config_file);
 void free_callback(const void *data, size_t datalen, void *extra);
 int caster_reload(struct caster_state *this);

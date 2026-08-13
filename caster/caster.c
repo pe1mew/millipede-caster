@@ -54,6 +54,7 @@ static void caster_alog(void *arg, struct gelf_entry *g, int level, const char *
 static int caster_reload_fetchers(struct caster_state *this, struct config *config,
 	struct caster_dynconfig *olddyn, struct caster_dynconfig *newdyn);
 static void caster_clear_signals(struct caster_state *this);
+static int listener_tls_conf_init(void);
 static int caster_start_fetchers(struct caster_state *this, struct config *config, struct caster_dynconfig *newdyn);
 static void dynconfig_free_fetchers(struct caster_dynconfig *this);
 static void listener_free(struct listener *this);
@@ -276,6 +277,11 @@ caster_new(const char *config_file, int nbase) {
 		this->base[i] = base;
 	}
 
+	if (listener_tls_conf_init() < 0) {
+		ERR_print_errors_cb(caster_tls_log_cb, this);
+		goto cancel;
+	}
+
 	this->ssl_client_ctx = SSL_CTX_new(TLS_client_method());
 	if (this->ssl_client_ctx == NULL) {
 		ERR_print_errors_cb(caster_tls_log_cb, this);
@@ -482,15 +488,16 @@ void caster_free(struct caster_state *this) {
 }
 
 /*
- * Load TLS certificates from file paths.
+ * Load TLS certificates from file paths into a SSL context.
  */
-static int listener_load_certs(struct listener *this, const char *tls_full_certificate_chain, const char *tls_private_key) {
+static int listener_load_certs(struct listener *this, SSL_CTX *ssl_ctx,
+	const char *tls_full_certificate_chain, const char *tls_private_key) {
 	char *full_certificate_chain = joinpath(this->caster->config_dir, tls_full_certificate_chain);
 	char *private_key = joinpath(this->caster->config_dir, tls_private_key);
 
 	if (full_certificate_chain == NULL || private_key == NULL
-		|| SSL_CTX_use_certificate_chain_file(this->ssl_server_ctx, full_certificate_chain) <= 0
-		|| SSL_CTX_use_PrivateKey_file(this->ssl_server_ctx, private_key, SSL_FILETYPE_PEM) <= 0) {
+		|| SSL_CTX_use_certificate_chain_file(ssl_ctx, full_certificate_chain) <= 0
+		|| SSL_CTX_use_PrivateKey_file(ssl_ctx, private_key, SSL_FILETYPE_PEM) <= 0) {
 		strfree(private_key);
 		strfree(full_certificate_chain);
 		return -1;
@@ -498,7 +505,7 @@ static int listener_load_certs(struct listener *this, const char *tls_full_certi
 	strfree(private_key);
 	strfree(full_certificate_chain);
 
-	if (!SSL_CTX_check_private_key(this->ssl_server_ctx)) {
+	if (!SSL_CTX_check_private_key(ssl_ctx)) {
 		char ip[64];
 		logfmt(&this->caster->flog, LOG_ERR, "Private key for %s does not match the certificate public key", ip_str_port(&this->sockaddr, ip, sizeof ip));
 		return -1;
@@ -506,41 +513,152 @@ static int listener_load_certs(struct listener *this, const char *tls_full_certi
 	return 0;
 }
 
+/*
+ * TLS parameters attached to a SSL_CTX, needed by the SNI callback.
+ *
+ * Read-only once the SSL_CTX has been published in a listener.
+ * Its lifetime is handled by OpenSSL through the ex_data mechanism:
+ * it is freed with the SSL_CTX, which OpenSSL keeps alive as long as
+ * sessions reference it. It is therefore safe to use from a callback
+ * even after a configuration reload replaced it on the listener.
+ */
+struct listener_tls_conf {
+	struct caster_state *caster;
+	char *hostname;			// hostname for TLS/SNI, may be NULL
+};
+
+static int listener_tls_conf_idx = -1;
+
+static void listener_tls_conf_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
+	int idx, long argl, void *argp) {
+	struct listener_tls_conf *this = (struct listener_tls_conf *)ptr;
+	if (this == NULL)
+		return;
+	strfree(this->hostname);
+	free(this);
+}
+
+/*
+ * Reserve the ex_data slot used to attach a struct listener_tls_conf
+ * to a SSL_CTX. Called once at startup.
+ */
+static int listener_tls_conf_init(void) {
+	if (listener_tls_conf_idx == -1)
+		listener_tls_conf_idx = SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL, listener_tls_conf_free);
+	return listener_tls_conf_idx == -1 ? -1 : 0;
+}
+
+/*
+ * Build the TLS parameters for a new SSL_CTX and hand their ownership
+ * over to it.
+ */
+static int listener_tls_conf_new(struct caster_state *caster, SSL_CTX *ssl_ctx, const char *hostname) {
+	struct listener_tls_conf *this = (struct listener_tls_conf *)malloc(sizeof(*this));
+	if (this == NULL)
+		return -1;
+	this->caster = caster;
+	this->hostname = NULL;
+	if (hostname) {
+		this->hostname = mystrdup(hostname);
+		if (this->hostname == NULL) {
+			free(this);
+			return -1;
+		}
+	}
+	if (SSL_CTX_set_ex_data(ssl_ctx, listener_tls_conf_idx, this) != 1) {
+		strfree(this->hostname);
+		free(this);
+		return -1;
+	}
+	return 0;
+}
+
 static int tls_sni_callback(SSL *ssl, int *al, void *arg) {
-	struct listener *listener = (struct listener *)arg;
+	struct listener_tls_conf *tls_conf = (struct listener_tls_conf *)arg;
 	const char *hostname = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
-	logfmt(&listener->caster->flog, LOG_INFO, "SNI callback hostname %s", hostname);
-	if (hostname == NULL || strcmp(hostname, listener->hostname))
+	logfmt(&tls_conf->caster->flog, LOG_INFO, "SNI callback hostname %s", hostname);
+	if (hostname == NULL || strcmp(hostname, tls_conf->hostname))
 		return SSL_TLSEXT_ERR_NOACK;
 	return SSL_TLSEXT_ERR_OK;
 }
 
 /*
  * Set-up or update TLS server configuration.
+ *
+ * A new SSL context is built from the new configuration, then swapped in.
+ * The current one is never modified, as it can be in use by other threads.
  */
 static int listener_setup_tls(struct listener *this, struct config_bind *config) {
-	if (!this->ssl_server_ctx) {
-		this->ssl_server_ctx = SSL_CTX_new(TLS_server_method());
-		if (this->ssl_server_ctx == NULL) {
-			ERR_print_errors_cb(caster_tls_log_cb, this->caster);
-			return -1;
-		}
-		if (config->hostname) {
-			this->hostname = mystrdup(config->hostname);
-			if (this->hostname == NULL)
-				return -1;
-			/* Configure a SNI callback */
-			SSL_CTX_set_tlsext_servername_callback(this->ssl_server_ctx, tls_sni_callback);
-			SSL_CTX_set_tlsext_servername_arg(this->ssl_server_ctx, this);
-		}
-	}
-	if (listener_load_certs(this, config->tls_full_certificate_chain, config->tls_private_key) < 0) {
+	SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_server_method());
+	if (ssl_ctx == NULL) {
 		ERR_print_errors_cb(caster_tls_log_cb, this->caster);
-		SSL_CTX_free(this->ssl_server_ctx);
-		this->ssl_server_ctx = NULL;
 		return -1;
 	}
+
+	if (listener_tls_conf_new(this->caster, ssl_ctx, config->hostname) < 0) {
+		char ip[64];
+		logfmt(&this->caster->flog, LOG_ERR, "Can't set the TLS parameters for %s", ip_str_port(&this->sockaddr, ip, sizeof ip));
+		SSL_CTX_free(ssl_ctx);
+		return -1;
+	}
+
+	if (config->hostname) {
+		/* Configure a SNI callback */
+		SSL_CTX_set_tlsext_servername_arg(ssl_ctx, SSL_CTX_get_ex_data(ssl_ctx, listener_tls_conf_idx));
+		SSL_CTX_set_tlsext_servername_callback(ssl_ctx, tls_sni_callback);
+	}
+
+	if (listener_load_certs(this, ssl_ctx, config->tls_full_certificate_chain, config->tls_private_key) < 0) {
+		ERR_print_errors_cb(caster_tls_log_cb, this->caster);
+		SSL_CTX_free(ssl_ctx);
+		return -1;
+	}
+
+	/*
+	 * The context is ready: publish it and activate TLS on this listener.
+	 * Activation is needed when reusing a listener which was not in TLS mode.
+	 */
+	P_RWLOCK_WRLOCK(&this->lock);
+	SSL_CTX *old_ssl_ctx = this->ssl_server_ctx;
+	this->ssl_server_ctx = ssl_ctx;
+	this->tls = 1;
+	P_RWLOCK_UNLOCK(&this->lock);
+
+	/* Only drops our reference, sessions still using it keep it alive */
+	if (old_ssl_ctx)
+		SSL_CTX_free(old_ssl_ctx);
 	return 0;
+}
+
+/*
+ * Deactivate TLS on a listener kept from a previous configuration.
+ */
+static void listener_disable_tls(struct listener *this) {
+	P_RWLOCK_WRLOCK(&this->lock);
+	SSL_CTX *old_ssl_ctx = this->ssl_server_ctx;
+	this->ssl_server_ctx = NULL;
+	this->tls = 0;
+	P_RWLOCK_UNLOCK(&this->lock);
+
+	if (old_ssl_ctx)
+		SSL_CTX_free(old_ssl_ctx);
+}
+
+/*
+ * Return a new SSL session to accept a connection on this listener,
+ * or NULL if TLS is not activated or the session can't be created.
+ *
+ * *tls is set to the TLS status of the listener.
+ */
+SSL *listener_ssl_new(struct listener *this, int *tls) {
+	SSL *ssl = NULL;
+	P_RWLOCK_RDLOCK(&this->lock);
+	*tls = this->tls;
+	if (this->tls && this->ssl_server_ctx)
+		/* Takes its own reference on the context */
+		ssl = SSL_new(this->ssl_server_ctx);
+	P_RWLOCK_UNLOCK(&this->lock);
+	return ssl;
 }
 
 /*
@@ -556,11 +674,12 @@ static struct listener *listener_new(struct caster_state *this, struct config_bi
 	listener->caster = this;
 	listener->tls = config->tls;
 	listener->ssl_server_ctx = NULL;
-	listener->hostname = NULL;
+	P_RWLOCK_INIT(&listener->lock, NULL);
 	REFCNT_INIT(listener);
 
 	if (config->tls && config->tls_full_certificate_chain && config->tls_private_key) {
 		if (listener_setup_tls(listener, config) < 0) {
+			P_RWLOCK_DESTROY(&listener->lock);
 			free(listener);
 			return NULL;
 		}
@@ -571,6 +690,9 @@ static struct listener *listener_new(struct caster_state *this, struct config_bi
 		(struct sockaddr *)sin, sin->generic.sa_family == AF_INET ? sizeof(sin->v4) : sizeof(sin->v6));
 	if (!listener->listener) {
 		logfmt(&this->flog, LOG_ERR, "Could not create a listener for %s:%d!", config->ip, config->port);
+		if (listener->ssl_server_ctx)
+			SSL_CTX_free(listener->ssl_server_ctx);
+		P_RWLOCK_DESTROY(&listener->lock);
 		free(listener);
 		return NULL;
 	}
@@ -582,8 +704,9 @@ static void listener_free(struct listener *this) {
 	logfmt(&this->caster->flog, LOG_INFO, "Closing listener %s", ip_str_port(&this->sockaddr, ip, sizeof ip));
 	if (this->listener)
 		evconnlistener_free(this->listener);
-	if (this->tls && this->ssl_server_ctx)
+	if (this->ssl_server_ctx)
 		SSL_CTX_free(this->ssl_server_ctx);
+	P_RWLOCK_DESTROY(&this->lock);
 	free(this);
 }
 
@@ -652,10 +775,8 @@ static int caster_reload_listeners(struct caster_state *this,
 				listener_decref(recycled_listener);
 				recycled_listener = NULL;
 			} else {
-				if (recycled_listener->tls && !config->tls) {
-					recycled_listener->tls = 0;
-					SSL_CTX_free(recycled_listener->ssl_server_ctx);
-				}
+				if (recycled_listener->tls && !config->tls)
+					listener_disable_tls(recycled_listener);
 				logfmt(&this->flog, LOG_INFO, "Reusing listener %s", ip_str_port(&sin, ip, sizeof ip));
 				new_listeners[nlisteners++] = recycled_listener;
 			}
